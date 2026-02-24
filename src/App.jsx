@@ -77,16 +77,19 @@ const FONT = Object.fromEntries(
 const WORDS = [
   { start: 0.1, end: 0.2, text: "CH" },
   { start: 0.2, end: 0.3, text: "CHH" },
-  { start: 0.3, end: 0.45, text: "CHECK" },
-  { start: 0.45, end: 0.55, text: "ONE" },
-  { start: 0.55, end: 0.65, text: "TWO" },
+  { start: 0.3, end: 0.43, text: "CHECK" },
+  { start: 0.46, end: 0.54, text: "ONE" },
+  { start: 0.57, end: 0.65, text: "TWO" },
 ];
+
+// Exit anim duration — must be longer than segMerge (500ms) + max center-out stagger
+const EXIT_DURATION = 750;
 
 function buildWordColumns(text) {
   const cols = [];
   [...text.toUpperCase()].forEach((char, ci) => {
     (FONT[char] ?? FONT[" "]).forEach((segs) => cols.push(segs));
-    if (ci < text.length - 1) cols.push(null); // letter gap
+    if (ci < text.length - 1) cols.push(null);
   });
   return cols;
 }
@@ -94,22 +97,25 @@ function buildWordColumns(text) {
 // ─── Keyframes ────────────────────────────────────────────────────────────────
 const STYLE = `
   @keyframes segGrow {
-    0%   { transform: scaleY(0.02); opacity: 1; }
-    55%  { transform: scaleY(1.12); }
-    75%  { transform: scaleY(0.96); }
-    100% { transform: scaleY(1);    opacity: 1; }
+    0%   { transform: scaleY(0.02); background: #b0b0b0; }
+    40%  { background: #b0b0b0; }
+    70%  { transform: scaleY(1.45); }
+    85%  { transform: scaleY(0.85); }
+    100% { transform: scaleY(1);    background: #9fcc9f; }
   }
-  @keyframes segShrink {
-    from { transform: scaleY(1);    opacity: 1; }
-    to   { transform: scaleY(0.02); opacity: 1; }
+  @keyframes segMerge {
+    0%   { transform: scaleY(1);    background: #9fcc9f; }
+    40%  { transform: scaleY(1.1);  background: #b8d4b8; }
+    100% { transform: scaleY(0.02); background: #b0b0b0; }
   }
   @keyframes barShrink {
     from { transform: translateY(-50%) scaleY(1);    opacity: 1; }
     to   { transform: translateY(-50%) scaleY(0.02); opacity: 1; }
   }
-  @keyframes barGrow {
-    from { transform: translateY(-50%) scaleY(0.02); opacity: 1; }
-    to   { transform: translateY(-50%) scaleY(1);    opacity: 1; }
+  @keyframes barReveal {
+    0%   { transform: translateY(-50%) scaleY(0.02); opacity: 0; }
+    60%  { transform: translateY(-50%) scaleY(0.02); opacity: 0; }
+    100% { transform: translateY(-50%) scaleY(1);    opacity: 1; }
   }
 `;
 
@@ -118,12 +124,14 @@ export default function AudioPlayer() {
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [displayWord, setDisplayWord] = useState(null);
-  const [exiting, setExiting] = useState(false);
-  // Lock the word zone start bar when the word first appears so it doesn't drift
+  const [exitingWord, setExitingWord] = useState(null);
+  const [exitingZoneStart, setExitingZoneStart] = useState(-1);
+  const [exitingZoneEnd, setExitingZoneEnd] = useState(-1);
+
   const lockedZoneEnd = useRef(null);
   const intervalRef = useRef(null);
   const waveformRef = useRef(null);
-  const exitTimer = useRef(null);
+  const exitWordTimer = useRef(null);
 
   useEffect(() => {
     if (playing) {
@@ -145,22 +153,41 @@ export default function AudioPlayer() {
   const activeWord =
     WORDS.find((w) => progress >= w.start && progress < w.end) ?? null;
 
+  // Promote a word+zone to the independent exit overlay
+  const promoteToExit = useCallback((word, zoneEnd) => {
+    const cols = buildWordColumns(word.text);
+    const start = Math.max(0, zoneEnd - cols.length);
+    setExitingWord(word);
+    setExitingZoneStart(start);
+    setExitingZoneEnd(zoneEnd);
+    clearTimeout(exitWordTimer.current);
+    exitWordTimer.current = setTimeout(
+      () => setExitingWord(null),
+      EXIT_DURATION,
+    );
+  }, []);
+
   useEffect(() => {
-    clearTimeout(exitTimer.current);
     if (activeWord) {
       if (!displayWord || displayWord.text !== activeWord.text) {
-        // Lock the zone end to the bar index at the moment the word appears
+        // Promote current word to exit overlay before swapping in new one
+        if (displayWord) {
+          promoteToExit(
+            displayWord,
+            lockedZoneEnd.current ?? Math.floor(progress * BAR_HEIGHTS.length),
+          );
+        }
         lockedZoneEnd.current = Math.floor(progress * BAR_HEIGHTS.length);
-        setExiting(false);
         setDisplayWord(activeWord);
       }
     } else if (displayWord) {
-      setExiting(true);
-      exitTimer.current = setTimeout(() => {
-        setDisplayWord(null);
-        setExiting(false);
-        lockedZoneEnd.current = null;
-      }, 350);
+      // No incoming word — promote to exit overlay and clear display
+      promoteToExit(
+        displayWord,
+        lockedZoneEnd.current ?? Math.floor(progress * BAR_HEIGHTS.length),
+      );
+      setDisplayWord(null);
+      lockedZoneEnd.current = null;
     }
   }, [activeWord?.text]);
 
@@ -170,25 +197,25 @@ export default function AudioPlayer() {
   }, []);
 
   const playedBars = Math.floor(progress * BAR_HEIGHTS.length);
-  const currentBarH = BAR_HEIGHTS[Math.min(playedBars, BAR_HEIGHTS.length - 1)];
-  const indicatorH = Math.max(3, (currentBarH / MAX_BAR) * PILL_H);
   const TRACK_PAD = 12;
-  const BTN_W = 64 + 8; // button + paddingRight
+  const BTN_W = 64 + 8;
   const BAR_W = 2.5;
-  const WAVEFORM_W = 453 - TRACK_PAD * 2 - BTN_W; // area bars must fill
-  // Gap computed so all bars span exactly WAVEFORM_W
+  const WAVEFORM_W = 453 - TRACK_PAD * 2 - BTN_W;
   const BAR_GAP =
     (WAVEFORM_W - BAR_HEIGHTS.length * BAR_W) / (BAR_HEIGHTS.length - 1);
-  // Indicator travels the same waveform area in sync with progress
   const indicatorLeft = TRACK_PAD + progress * WAVEFORM_W;
   const timeLabel = `0:${String(Math.round(progress * 100)).padStart(2, "0")}`;
   const wordColumns = displayWord ? buildWordColumns(displayWord.text) : null;
 
-  // The word zone is a fixed slice of bar indices, locked when word appeared
   const zoneEnd = lockedZoneEnd.current ?? playedBars;
   const zoneStart = wordColumns
     ? Math.max(0, zoneEnd - wordColumns.length)
     : -1;
+
+  const exitingColumns = exitingWord
+    ? buildWordColumns(exitingWord.text)
+    : null;
+  const exitingCenter = exitingColumns ? (exitingColumns.length - 1) / 2 : 0;
 
   return (
     <div style={s.page}>
@@ -247,13 +274,11 @@ export default function AudioPlayer() {
           ></path>
         </svg>
       </div>
-      {/* Shell provides positioning context for the time label outside the pill */}
+
       <div style={s.shell}>
-        {/* Time label sits above the pill, moves with indicator */}
         <div style={{ ...s.timeLabel, left: indicatorLeft }}>{timeLabel}</div>
 
         <div style={s.track}>
-          {/* Indicator — behind the play button */}
           <div
             style={{
               ...s.indicator,
@@ -268,10 +293,11 @@ export default function AudioPlayer() {
             style={{ ...s.waveformWrap, gap: BAR_GAP }}
             onClick={handleWaveformClick}
           >
-            {/* Bars — letter zone bars render as bitmap columns, rest as waveform */}
             {BAR_HEIGHTS.map((h, i) => {
               const played = i < playedBars;
               const inZone = wordColumns && i >= zoneStart && i < zoneEnd;
+              const inExitZone =
+                exitingWord && i >= exitingZoneStart && i < exitingZoneEnd;
               const scaledH = Math.max(3, (h / MAX_BAR) * PILL_H);
 
               if (!inZone) {
@@ -282,16 +308,17 @@ export default function AudioPlayer() {
                       ...s.bar,
                       height: scaledH,
                       background: played ? "#b0b0b0" : "#606060",
+                      opacity: inExitZone ? 0 : 1,
                     }}
                   />
                 );
               }
 
-              // This bar slot is inside the word zone — render as a letter column
               const colIdx = i - zoneStart;
+              const centerIdx = (wordColumns.length - 1) / 2;
+              const distFromCenter = Math.abs(colIdx - centerIdx);
               const segs = wordColumns[colIdx];
 
-              // null = inter-letter gap column
               if (segs === null) {
                 return (
                   <div
@@ -308,20 +335,18 @@ export default function AudioPlayer() {
 
               return (
                 <div key={i} style={s.letterCol}>
-                  {/* Waveform bar — shrinks out on enter, grows back on exit */}
+                  {/* Bar shrinks out as word enters */}
                   <div
                     style={{
                       ...s.bar,
                       position: "absolute",
                       top: "50%",
-                      transform: `translateY(-50%)`,
+                      transform: "translateY(-50%)",
                       height: scaledH,
                       background: "#b0b0b0",
                       transformOrigin: "center",
-                      animation: exiting
-                        ? `barGrow   0.35s cubic-bezier(0.22, 1, 0.36, 1) both`
-                        : `barShrink 0.18s cubic-bezier(0.4, 0, 1, 1) both`,
-                      animationDelay: `${colIdx * 8}ms`,
+                      animation: `barShrink 0.35s cubic-bezier(0.4, 0, 1, 1) both`,
+                      animationDelay: `${distFromCenter * 25}ms`,
                     }}
                   />
                   {segs.map((seg, j) => (
@@ -335,21 +360,75 @@ export default function AudioPlayer() {
                         background: "#9fcc9f",
                         borderRadius: 1,
                         transformOrigin: "center",
-                        animation: exiting
-                          ? `segShrink 0.18s cubic-bezier(0.4, 0, 1, 1) both`
-                          : `segGrow   0.35s cubic-bezier(0.22, 1, 0.36, 1) both`,
-                        animationDelay: exiting
-                          ? `${colIdx * 6}ms`
-                          : `${colIdx * 8}ms`,
+                        animation: `segGrow 0.60s cubic-bezier(0.34, 1.56, 0.64, 1) both`,
+                        animationDelay: `${distFromCenter * 25}ms`,
                       }}
                     />
                   ))}
                 </div>
               );
             })}
+
+            {/* Independent exiting zone — renders on top, unaffected by incoming word */}
+            {exitingColumns &&
+              exitingColumns.map((segs, colIdx) => {
+                const barIdx = exitingZoneStart + colIdx;
+                const h = BAR_HEIGHTS[barIdx] ?? 3;
+                const scaledH = Math.max(3, (h / MAX_BAR) * PILL_H);
+                const distFromCenter = Math.abs(colIdx - exitingCenter);
+                const slotW = BAR_W + BAR_GAP;
+                const leftPx = exitingZoneStart * slotW + colIdx * slotW;
+
+                if (segs === null) return null;
+
+                return (
+                  <div
+                    key={`ex-${colIdx}`}
+                    style={{
+                      ...s.letterCol,
+                      position: "absolute",
+                      left: leftPx,
+                      top: 0,
+                      bottom: 0,
+                      pointerEvents: "none",
+                    }}
+                  >
+                    {/* Waveform bar grows back in */}
+                    <div
+                      style={{
+                        ...s.bar,
+                        position: "absolute",
+                        top: "50%",
+                        transform: "translateY(-50%)",
+                        height: scaledH,
+                        background: "#b0b0b0",
+                        transformOrigin: "center",
+                        animation: `barReveal 0.55s ease-out both`,
+                        animationDelay: `${distFromCenter * 25}ms`,
+                      }}
+                    />
+                    {/* Letter segs merge back to grey */}
+                    {segs.map((seg, j) => (
+                      <div
+                        key={j}
+                        style={{
+                          position: "absolute",
+                          top: `${seg.top * 100}%`,
+                          height: `${seg.height * 100}%`,
+                          width: "100%",
+                          background: "#9fcc9f",
+                          borderRadius: 1,
+                          transformOrigin: "center",
+                          animation: `segMerge 0.50s cubic-bezier(0.4, 0, 0.8, 1) both`,
+                          animationDelay: `${distFromCenter * 25}ms`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                );
+              })}
           </div>
 
-          {/* Play / Pause — higher z-index so it sits above the indicator */}
           <button
             style={s.btn}
             onClick={() => setPlaying((p) => !p)}
@@ -365,9 +444,7 @@ export default function AudioPlayer() {
             )}
           </button>
         </div>
-        {/* end track */}
       </div>
-      {/* end shell */}
     </div>
   );
 }
@@ -383,14 +460,8 @@ const s = {
     flexDirection: "column",
     background: "#3c3c3c",
   },
-  logo: {
-    width: "114px",
-    height: "auto",
-    paddingBottom: "18px",
-  },
-  shell: {
-    position: "relative",
-  },
+  logo: { width: "114px", height: "auto", paddingBottom: "18px" },
+  shell: { position: "relative" },
   track: {
     position: "relative",
     display: "flex",
@@ -436,12 +507,7 @@ const s = {
     transition: "left 0.03s linear",
     whiteSpace: "nowrap",
   },
-  bar: {
-    width: 2.5,
-    borderRadius: 2,
-    flexShrink: 0,
-  },
-  // A bar slot that can hold multiple positioned segments
+  bar: { width: 2.5, borderRadius: 2, flexShrink: 0 },
   letterCol: {
     position: "relative",
     width: 2.5,
