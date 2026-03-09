@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import demoMp3 from "./assets/demo2.mp3";
 
 // ─── Waveform data ────────────────────────────────────────────────────────────
@@ -26,6 +26,11 @@ const DOT_TOP_OFFSET =
   (PILL_H - ((GRID_ROWS - 1) * DOT_SPACING + DOT_SIZE)) / 2;
 const DOT_LEFT_PAD = (WAVEFORM_W - GRID_COLS * DOT_SPACING) / 2;
 const FONT_ROW_OFFSET = Math.floor((GRID_ROWS - 7) / 2);
+// Word-zone crops to a 5-dot window centred in the 11-row grid (font rows 1-5)
+const WORD_ZONE_TOP = 3; // grid row where word dots start
+const WORD_ZONE_BOT = 7; // grid row where word dots end (inclusive)
+const WORD_ZONE_CENTER = (WORD_ZONE_TOP + WORD_ZONE_BOT) / 2; // 5.0
+const WORD_ZONE_HALF = (WORD_ZONE_BOT - WORD_ZONE_TOP) / 2; // 2.0
 
 // ─── Bitmap font (kept for future word-cue integration) ───────────────────────
 const FONT_BITMAP = {
@@ -74,7 +79,29 @@ const FONT_DOTS = Object.fromEntries(
   Object.entries(FONT_BITMAP).map(([k, v]) => [k, bitmapToColumnDots(v)]),
 );
 
-// Word cues & exit timing (kept for future integration)
+// Compress 7 font rows → 5 display rows by OR-merging adjacent pairs.
+// This preserves all font data rather than hard-cropping.
+const FONT_TO_5_ROWS = [[0], [1, 2], [3], [4, 5], [6]];
+
+function buildWordDots(text) {
+  const cols = [];
+  [...text.toUpperCase()].forEach((char, ci) => {
+    const fontRows = FONT_BITMAP[char] ?? FONT_BITMAP[" "];
+    const numFontCols = fontRows[0].length; // 5 for every character
+    for (let fc = 0; fc < numFontCols; fc++) {
+      const col = Array.from({ length: GRID_ROWS }, (_, r) => {
+        const dr = r - WORD_ZONE_TOP; // display row 0-4 for r=3..7
+        if (dr < 0 || dr >= 5) return false;
+        return FONT_TO_5_ROWS[dr].some((fr) => fontRows[fr][fc] === "1");
+      });
+      cols.push(col);
+    }
+    if (ci < text.length - 1) cols.push(null); // 1-col inter-letter gap
+  });
+  return cols;
+}
+
+// Word cues & exit timing
 const WORDS = [
   { start: 0.1, end: 0.2, text: "CH" },
   { start: 0.2, end: 0.3, text: "CHH" },
@@ -83,6 +110,8 @@ const WORDS = [
   { start: 0.57, end: 0.65, text: "TWO" },
 ];
 const EXIT_DURATION = 750;
+const BPM = 130;
+const BREATH_MS = Math.round((2 * 60000) / BPM); // 923ms = 2 kicks at 130 BPM
 
 // ─── Dot color ────────────────────────────────────────────────────────────────
 // Contrast knobs:
@@ -119,11 +148,18 @@ export default function AudioPlayer() {
     }),
   );
 
+  // Word cue state
+  const [activeWord, setActiveWord] = useState(null);
+  const [displayWord, setDisplayWord] = useState(null);
+  const [exiting, setExiting] = useState(false);
+
   const audioRef = useRef(null);
   const analyserRef = useRef(null);
   const audioCtxRef = useRef(null);
   const animFrameRef = useRef(null);
   const setupDoneRef = useRef(false);
+  const exitTimerRef = useRef(null);
+  const activeWordRef = useRef(null);
 
   // ── Web Audio setup (once, on first user gesture) ──────────────────────────
   const setupAudio = useCallback(() => {
@@ -214,6 +250,17 @@ export default function AudioPlayer() {
       //   frameMax = Math.max(frameMax, rawPeaks[c]);
       // }
 
+      // Track progress for word cues
+      const dur = audioRef.current?.duration;
+      const ct = audioRef.current?.currentTime;
+      const progress = dur ? ct / dur : 0;
+      const newActive =
+        WORDS.find((w) => progress >= w.start && progress < w.end) ?? null;
+      if (newActive?.text !== activeWordRef.current?.text) {
+        activeWordRef.current = newActive;
+        setActiveWord(newActive);
+      }
+
       // Decay faster so quiet sections actually drop; floor prevents bloat
       peakMax = Math.max(0.12, Math.max(frameMax, peakMax * 0.97));
 
@@ -238,8 +285,39 @@ export default function AudioPlayer() {
     return () => cancelAnimationFrame(animFrameRef.current);
   }, [playing]);
 
+  // ── Word cue transition ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (activeWord && activeWord.text !== displayWord?.text) {
+      clearTimeout(exitTimerRef.current);
+      setExiting(false);
+      setDisplayWord(activeWord);
+    } else if (!activeWord && displayWord) {
+      setExiting(true);
+      exitTimerRef.current = setTimeout(() => {
+        setDisplayWord(null);
+        setExiting(false);
+      }, EXIT_DURATION);
+    }
+  }, [activeWord?.text]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const wordCols = useMemo(
+    () => (displayWord ? buildWordDots(displayWord.text) : null),
+    [displayWord?.text], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
   return (
     <div style={s.page}>
+      <style>{`
+        @keyframes breathe {
+          0%, 100% { opacity: 0; }
+          50%      { opacity: 1; }
+        }
+        @keyframes dotOut {
+          0%   { opacity: 1; }
+          100% { opacity: 0; }
+        }
+      `}</style>
+
       {/* Hidden audio element */}
       <audio ref={audioRef} src={demoMp3} preload="auto" />
 
@@ -305,32 +383,70 @@ export default function AudioPlayer() {
             {Array.from({ length: GRID_ROWS * GRID_COLS }, (_, idx) => {
               const c = idx % GRID_COLS;
               const r = Math.floor(idx / GRID_COLS);
-              const amp = buffer[c];
-              // Per-column noise: deterministic offset that occasionally drops
-              // the baseline dot on quiet columns. Tune 0.01 (rare) – 0.08 (frequent).
-              const jitter = ((c * 7 + 3) % 9) / 9;
 
-              //This floor of 1 is what enforces the unbroken baseline, 0 = broken.
-              //V
-              const numLit = Math.max(
-                0,
-                Math.round((amp - jitter * 0.04) * GRID_ROWS),
-              );
-              //                           ^^^^
-              //                                    0.01 = very rare dropout
-              //                                    0.04 = roughly every 9th column at baseline
-              //                                    0.08 = frequent, noticeable gaps
-              return (
-                <div
-                  key={`d-${c}-${r}`}
-                  style={{
+              const inWordZone = wordCols != null && c < wordCols.length;
+
+              let dotStyle;
+              if (inWordZone) {
+                const wordCol = wordCols[c];
+                const lit = wordCol != null && wordCol[r] === true;
+                // Per-row opacity gradient: brighter at centre, dimmer at zone edges
+                const dist = Math.abs(r - WORD_ZONE_CENTER) / WORD_ZONE_HALF;
+                const peakOp = 0.9 * (1 - dist * 0.6); // 0.9 centre → 0.36 edges
+
+                if (lit) {
+                  // Row stagger from centre outward — mimics soundform growing from baseline.
+                  // Column stagger only on exit (centre-out collapse).
+                  const rowStagger = Math.abs(r - WORD_ZONE_CENTER) * 60;
+                  const centerCol = (wordCols.length - 1) / 2;
+                  const colStagger = exiting ? Math.abs(c - centerCol) * 15 : 0;
+                  const animName = exiting ? "dotOut" : "breathe";
+                  const animDuration = exiting
+                    ? Math.round(EXIT_DURATION * 0.6)
+                    : BREATH_MS;
+                  const animIter = exiting ? "1" : "infinite";
+                  dotStyle = {
                     ...s.dot,
                     left: DOT_LEFT_PAD + c * DOT_SPACING,
                     top: DOT_TOP_OFFSET + r * DOT_SPACING,
-                    background: getDotColor(r, numLit, amp),
-                  }}
-                />
-              );
+                    background: `rgba(255,160,92,${peakOp.toFixed(3)})`,
+                    animation: `${animName} ${animDuration}ms ease-in-out ${rowStagger + colStagger}ms ${animIter}`,
+                    animationFillMode: exiting ? "forwards" : "backwards",
+                  };
+                } else {
+                  // Unlit slot in word zone: static dim dot, no animation
+                  dotStyle = {
+                    ...s.dot,
+                    left: DOT_LEFT_PAD + c * DOT_SPACING,
+                    top: DOT_TOP_OFFSET + r * DOT_SPACING,
+                    background: `rgba(144,169,234,${DIM_OPACITY})`,
+                  };
+                }
+              } else {
+                const amp = buffer[c];
+                // Per-column noise: deterministic offset that occasionally drops
+                // the baseline dot on quiet columns. Tune 0.01 (rare) – 0.08 (frequent).
+                const jitter = ((c * 7 + 3) % 9) / 9;
+
+                //This floor of 1 is what enforces the unbroken baseline, 0 = broken.
+                //V
+                const numLit = Math.max(
+                  0,
+                  Math.round((amp - jitter * 0.04) * GRID_ROWS),
+                );
+                //                           ^^^^
+                //                                    0.01 = very rare dropout
+                //                                    0.04 = roughly every 9th column at baseline
+                //                                    0.08 = frequent, noticeable gaps
+                dotStyle = {
+                  ...s.dot,
+                  left: DOT_LEFT_PAD + c * DOT_SPACING,
+                  top: DOT_TOP_OFFSET + r * DOT_SPACING,
+                  background: getDotColor(r, numLit, amp),
+                };
+              }
+
+              return <div key={`d-${c}-${r}`} style={dotStyle} />;
             })}
           </div>
 
